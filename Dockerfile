@@ -1,9 +1,19 @@
-FROM eclipse-temurin:21-jdk
+FROM maven:3.9.9-eclipse-temurin-21 AS build
 
 WORKDIR /app
 
-COPY DispatchApiServer.java .
+COPY pom.xml .
+COPY src ./src
 
-RUN javac DispatchApiServer.java
+RUN mvn -q -DskipTests package dependency:copy-dependencies \
+    -DoutputDirectory=target/dependency
 
-CMD ["java", "DispatchApiServer"]
+
+FROM eclipse-temurin:21-jre
+
+WORKDIR /app
+
+COPY --from=build /app/target/classes ./target/classes
+COPY --from=build /app/target/dependency ./target/dependency
+
+CMD ["java", "-cp", "target/classes:target/dependency/*", "DispatchApiServer"]
