@@ -47,8 +47,8 @@ public class DispatchApiServer {
 
         System.out.println("========================================");
         System.out.println("Low Altitude Dispatch API started");
-        System.out.println("Version: 3.2");
-        System.out.println("Algorithm: Space-Time A*");
+        System.out.println("Version: 3.3");
+        System.out.println("Algorithm: Multi-Constraint Space-Time A*");
         System.out.println("Time mode: status-aware absolute internal / relative output");
         System.out.println("Port: " + port);
         System.out.println("========================================");
@@ -80,18 +80,26 @@ public class DispatchApiServer {
                 "Low Altitude Dispatch API"
         );
         result.put("status", "running");
-        result.put("version", "3.2");
+        result.put("version", "3.3");
         result.put(
                 "algorithmConnected",
                 true
         );
         result.put(
                 "algorithm",
-                "Space-Time A*"
+                "Multi-Constraint Space-Time A*"
         );
         result.put(
                 "timeMode",
                 "status-aware-absolute-internal-relative-output"
+        );
+        result.put(
+                "constraintMode",
+                "no-fly+obstacle+crowd-risk+dynamic-occupancy"
+        );
+        result.put(
+                "staticConstraintInput",
+                "constraintZones"
         );
 
         send(
@@ -163,6 +171,9 @@ public class DispatchApiServer {
 
             JsonNode flightPlansNode =
                     root.get("flightPlans");
+
+            JsonNode constraintZonesNode =
+                    root.get("constraintZones");
 
             if (
                     pickupNode == null
@@ -423,7 +434,62 @@ public class DispatchApiServer {
                     );
 
             // =====================================================
-            // 4. 构造未避让基准航迹
+            // 4. 静态三层约束
+            //    禁飞区：硬约束
+            //    障碍区：硬约束
+            //    人群风险区：软约束（风险代价）
+            // =====================================================
+
+            ConstraintData constraintData =
+                    buildConstraintData(
+                            constraintZonesNode,
+                            gridMax
+                    );
+
+            if (
+                    constraintData.hardBlockedCells
+                            .contains(start.key())
+            ) {
+
+                sendError(
+                        exchange,
+                        200,
+                        "被选无人机当前位置位于禁飞区或障碍区，无法执行本次规划"
+                );
+
+                return;
+            }
+
+            if (
+                    constraintData.hardBlockedCells
+                            .contains(pickup.key())
+            ) {
+
+                sendError(
+                        exchange,
+                        200,
+                        "取货点位于禁飞区或障碍区，无法执行本次规划"
+                );
+
+                return;
+            }
+
+            if (
+                    constraintData.hardBlockedCells
+                            .contains(delivery.key())
+            ) {
+
+                sendError(
+                        exchange,
+                        200,
+                        "送达点位于禁飞区或障碍区，无法执行本次规划"
+                );
+
+                return;
+            }
+
+            // =====================================================
+            // 5. 构造未避让基准航迹
             // =====================================================
 
             List<TimedPoint> baselinePath =
@@ -441,8 +507,26 @@ public class DispatchApiServer {
                             occupiedCells
                     );
 
+            int baselineHardConstraintViolationCount =
+                    countCellHits(
+                            baselinePath,
+                            constraintData.hardBlockedCells
+                    );
+
+            int baselineCrowdRiskPointCount =
+                    countRiskPoints(
+                            baselinePath,
+                            constraintData.crowdRiskCosts
+                    );
+
+            double baselineCrowdRiskCost =
+                    calculateRiskCost(
+                            baselinePath,
+                            constraintData.crowdRiskCosts
+                    );
+
             // =====================================================
-            // 5. 当前无人机 → 取货点
+            // 6. 当前无人机 → 取货点
             // =====================================================
 
             SpaceTimeAStar plannerToPickup =
@@ -450,7 +534,9 @@ public class DispatchApiServer {
                             gridMax,
                             STEP_MS,
                             CONFLICT_MARGIN_MS,
-                            occupiedCells
+                            occupiedCells,
+                            constraintData.hardBlockedCells,
+                            constraintData.crowdRiskCosts
                     );
 
             SegmentResult toPickup =
@@ -472,7 +558,7 @@ public class DispatchApiServer {
             }
 
             // =====================================================
-            // 6. 取货点 → 配送点
+            // 7. 取货点 → 配送点
             // =====================================================
 
             SpaceTimeAStar plannerToDelivery =
@@ -480,7 +566,9 @@ public class DispatchApiServer {
                             gridMax,
                             STEP_MS,
                             CONFLICT_MARGIN_MS,
-                            occupiedCells
+                            occupiedCells,
+                            constraintData.hardBlockedCells,
+                            constraintData.crowdRiskCosts
                     );
 
             SegmentResult toDelivery =
@@ -502,7 +590,7 @@ public class DispatchApiServer {
             }
 
             // =====================================================
-            // 7. 合并完整路径
+            // 8. 合并完整路径
             // =====================================================
 
             List<TimedPoint> fullPath =
@@ -524,7 +612,7 @@ public class DispatchApiServer {
             }
 
             // =====================================================
-            // 8. 检查避让后剩余冲突
+            // 9. 检查避让后剩余冲突与静态约束
             // =====================================================
 
             int remainingConflictCount =
@@ -532,6 +620,31 @@ public class DispatchApiServer {
                             fullPath,
                             occupiedCells
                     );
+
+            int plannedHardConstraintViolationCount =
+                    countCellHits(
+                            fullPath,
+                            constraintData.hardBlockedCells
+                    );
+
+            int plannedCrowdRiskPointCount =
+                    countRiskPoints(
+                            fullPath,
+                            constraintData.crowdRiskCosts
+                    );
+
+            double plannedCrowdRiskCost =
+                    calculateRiskCost(
+                            fullPath,
+                            constraintData.crowdRiskCosts
+                    );
+
+            boolean staticConstraintAdjusted =
+                    baselineHardConstraintViolationCount >
+                            plannedHardConstraintViolationCount
+                            ||
+                    baselineCrowdRiskCost >
+                            plannedCrowdRiskCost + 1e-9;
 
             long endTimeMs =
                     toDelivery.endTimeMs;
@@ -572,7 +685,7 @@ public class DispatchApiServer {
                     remainingConflictCount == 0;
 
             // =====================================================
-            // 9. 返回结果
+            // 10. 返回结果
             // =====================================================
 
             ObjectNode result =
@@ -595,7 +708,7 @@ public class DispatchApiServer {
 
             result.put(
                     "algorithm",
-                    "Space-Time A*"
+                    "Multi-Constraint Space-Time A*"
             );
 
             result.put(
@@ -646,6 +759,92 @@ public class DispatchApiServer {
             );
 
             result.put(
+                    "constraintMode",
+                    "no-fly+obstacle+crowd-risk+dynamic-occupancy"
+            );
+
+            result.put(
+                    "constraintZoneCount",
+                    constraintData.enabledZoneCount
+            );
+
+            result.put(
+                    "noFlyZoneCount",
+                    constraintData.noFlyZoneCount
+            );
+
+            result.put(
+                    "obstacleZoneCount",
+                    constraintData.obstacleZoneCount
+            );
+
+            result.put(
+                    "crowdRiskZoneCount",
+                    constraintData.crowdRiskZoneCount
+            );
+
+            result.put(
+                    "baselineHardConstraintViolationCount",
+                    baselineHardConstraintViolationCount
+            );
+
+            result.put(
+                    "plannedHardConstraintViolationCount",
+                    plannedHardConstraintViolationCount
+            );
+
+            result.put(
+                    "baselineCrowdRiskPointCount",
+                    baselineCrowdRiskPointCount
+            );
+
+            result.put(
+                    "plannedCrowdRiskPointCount",
+                    plannedCrowdRiskPointCount
+            );
+
+            result.put(
+                    "baselineCrowdRiskCost",
+                    round(baselineCrowdRiskCost)
+            );
+
+            result.put(
+                    "plannedCrowdRiskCost",
+                    round(plannedCrowdRiskCost)
+            );
+
+            result.put(
+                    "staticConstraintAdjusted",
+                    staticConstraintAdjusted
+            );
+
+            result.put(
+                    "hardConstraintSatisfied",
+                    plannedHardConstraintViolationCount == 0
+            );
+
+            result.put(
+                    "crowdRiskReduced",
+                    baselineCrowdRiskCost >
+                            plannedCrowdRiskCost + 1e-9
+            );
+
+            result.put(
+                    "noFlyCellCount",
+                    constraintData.noFlyCells.size()
+            );
+
+            result.put(
+                    "obstacleCellCount",
+                    constraintData.obstacleCells.size()
+            );
+
+            result.put(
+                    "crowdRiskCellCount",
+                    constraintData.crowdRiskCosts.size()
+            );
+
+            result.put(
                     "baselineConflictCount",
                     baselineConflictCount
             );
@@ -677,9 +876,13 @@ public class DispatchApiServer {
 
             result.put(
                     "resolution",
-                    conflictDetected
-                            ? "SPACE_TIME_ASTAR_AVOIDANCE"
-                            : "NONE"
+                    conflictDetected && staticConstraintAdjusted
+                            ? "MULTI_CONSTRAINT_SPACE_TIME_AVOIDANCE"
+                            : staticConstraintAdjusted
+                                    ? "STATIC_CONSTRAINT_AVOIDANCE"
+                                    : conflictDetected
+                                            ? "SPACE_TIME_ASTAR_AVOIDANCE"
+                                            : "NONE"
             );
 
             result.put(
@@ -711,7 +914,25 @@ public class DispatchApiServer {
                     "relative"
             );
 
-            if (conflictDetected) {
+            if (
+                    conflictDetected
+                            &&
+                    staticConstraintAdjusted
+            ) {
+
+                result.put(
+                        "message",
+                        "检测到静态区域约束与动态时空冲突，已使用多约束时空A*完成联合避让规划"
+                );
+
+            } else if (staticConstraintAdjusted) {
+
+                result.put(
+                        "message",
+                        "检测到禁飞/障碍/人群风险约束，已使用多约束时空A*完成约束感知路径规划"
+                );
+
+            } else if (conflictDetected) {
 
                 result.put(
                         "message",
@@ -722,7 +943,9 @@ public class DispatchApiServer {
 
                 result.put(
                         "message",
-                        "未检测到基准航迹时空冲突，已完成时空A*路径规划"
+                        constraintData.enabledZoneCount > 0
+                                ? "已加载静态三层约束，当前基准航迹无需额外绕行，已完成多约束时空A*路径规划"
+                                : "未检测到基准航迹时空冲突，已完成时空A*路径规划"
                 );
             }
 
@@ -806,6 +1029,493 @@ public class DispatchApiServer {
                     )
             );
         }
+    }
+
+    // =============================================================
+    // 静态三层约束解析
+    //
+    // 支持三种类型：
+    // NO_FLY / 禁飞区       -> 硬约束
+    // OBSTACLE / 障碍区     -> 硬约束
+    // CROWD_RISK / 人群风险区 -> 软约束
+    //
+    // 每个区域支持：
+    // 1. 矩形：xMin/xMax/yMin/yMax
+    // 2. 离散栅格：cells:[{x,y},...]
+    // 3. 多边形：polygon:[{x,y},...]
+    // =============================================================
+
+    private static ConstraintData buildConstraintData(
+            JsonNode zones,
+            int gridMax
+    ) {
+
+        Set<String> noFlyCells =
+                new HashSet<>();
+
+        Set<String> obstacleCells =
+                new HashSet<>();
+
+        Map<String, Double> crowdRiskCosts =
+                new HashMap<>();
+
+        int enabledZoneCount = 0;
+        int noFlyZoneCount = 0;
+        int obstacleZoneCount = 0;
+        int crowdRiskZoneCount = 0;
+
+        if (
+                zones == null
+                        ||
+                !zones.isArray()
+        ) {
+
+            return new ConstraintData(
+                    noFlyCells,
+                    obstacleCells,
+                    crowdRiskCosts,
+                    0,
+                    0,
+                    0,
+                    0
+            );
+        }
+
+        for (JsonNode zone : zones) {
+
+            if (
+                    zone.has("enabled")
+                            &&
+                    !zone.path("enabled")
+                            .asBoolean(true)
+            ) {
+                continue;
+            }
+
+            String type =
+                    normalizeConstraintType(
+                            zone.path("type")
+                                    .asText("")
+                    );
+
+            if (type.isBlank()) {
+                continue;
+            }
+
+            Set<String> zoneCells =
+                    rasterizeZone(
+                            zone,
+                            gridMax
+                    );
+
+            if (zoneCells.isEmpty()) {
+                continue;
+            }
+
+            enabledZoneCount++;
+
+            if ("NO_FLY".equals(type)) {
+
+                noFlyZoneCount++;
+                noFlyCells.addAll(zoneCells);
+
+            } else if ("OBSTACLE".equals(type)) {
+
+                obstacleZoneCount++;
+                obstacleCells.addAll(zoneCells);
+
+            } else if ("CROWD_RISK".equals(type)) {
+
+                crowdRiskZoneCount++;
+
+                double riskWeight =
+                        Math.max(
+                                0.0,
+                                zone.path("riskWeight")
+                                        .asDouble(4.0)
+                        );
+
+                for (String key : zoneCells) {
+
+                    crowdRiskCosts.merge(
+                            key,
+                            riskWeight,
+                            Math::max
+                    );
+                }
+            }
+        }
+
+        return new ConstraintData(
+                noFlyCells,
+                obstacleCells,
+                crowdRiskCosts,
+                enabledZoneCount,
+                noFlyZoneCount,
+                obstacleZoneCount,
+                crowdRiskZoneCount
+        );
+    }
+
+    private static String normalizeConstraintType(
+            String raw
+    ) {
+
+        if (raw == null) {
+            return "";
+        }
+
+        String text =
+                raw.trim();
+
+        String upper =
+                text.toUpperCase(
+                        Locale.ROOT
+                );
+
+        if (
+                upper.contains("NO_FLY")
+                        ||
+                upper.contains("NOFLY")
+                        ||
+                text.contains("禁飞")
+        ) {
+            return "NO_FLY";
+        }
+
+        if (
+                upper.contains("OBSTACLE")
+                        ||
+                text.contains("障碍")
+        ) {
+            return "OBSTACLE";
+        }
+
+        if (
+                upper.contains("CROWD")
+                        ||
+                upper.contains("RISK")
+                        ||
+                text.contains("人群")
+                        ||
+                text.contains("风险")
+        ) {
+            return "CROWD_RISK";
+        }
+
+        return "";
+    }
+
+    private static Set<String> rasterizeZone(
+            JsonNode zone,
+            int gridMax
+    ) {
+
+        Set<String> cells =
+                new HashSet<>();
+
+        JsonNode explicitCells =
+                zone.get("cells");
+
+        if (
+                explicitCells != null
+                        &&
+                explicitCells.isArray()
+        ) {
+
+            for (JsonNode cell : explicitCells) {
+
+                int x =
+                        cell.path("x")
+                                .asInt(-1);
+
+                int y =
+                        cell.path("y")
+                                .asInt(-1);
+
+                if (
+                        x >= 0
+                                &&
+                        y >= 0
+                                &&
+                        x < gridMax
+                                &&
+                        y < gridMax
+                ) {
+
+                    cells.add(
+                            x + "," + y
+                    );
+                }
+            }
+
+            if (!cells.isEmpty()) {
+                return cells;
+            }
+        }
+
+        if (
+                zone.has("xMin")
+                        &&
+                zone.has("xMax")
+                        &&
+                zone.has("yMin")
+                        &&
+                zone.has("yMax")
+        ) {
+
+            int xMin =
+                    Math.max(
+                            0,
+                            Math.min(
+                                    zone.path("xMin").asInt(),
+                                    zone.path("xMax").asInt()
+                            )
+                    );
+
+            int xMax =
+                    Math.min(
+                            gridMax - 1,
+                            Math.max(
+                                    zone.path("xMin").asInt(),
+                                    zone.path("xMax").asInt()
+                            )
+                    );
+
+            int yMin =
+                    Math.max(
+                            0,
+                            Math.min(
+                                    zone.path("yMin").asInt(),
+                                    zone.path("yMax").asInt()
+                            )
+                    );
+
+            int yMax =
+                    Math.min(
+                            gridMax - 1,
+                            Math.max(
+                                    zone.path("yMin").asInt(),
+                                    zone.path("yMax").asInt()
+                            )
+                    );
+
+            for (int x = xMin; x <= xMax; x++) {
+                for (int y = yMin; y <= yMax; y++) {
+                    cells.add(
+                            x + "," + y
+                    );
+                }
+            }
+
+            if (!cells.isEmpty()) {
+                return cells;
+            }
+        }
+
+        JsonNode polygon =
+                zone.get("polygon");
+
+        if (
+                polygon != null
+                        &&
+                polygon.isArray()
+                        &&
+                polygon.size() >= 3
+        ) {
+
+            List<GridPoint> points =
+                    new ArrayList<>();
+
+            for (JsonNode point : polygon) {
+
+                points.add(
+                        new GridPoint(
+                                point.path("x").asInt(),
+                                point.path("y").asInt()
+                        )
+                );
+            }
+
+            int minX = gridMax - 1;
+            int maxX = 0;
+            int minY = gridMax - 1;
+            int maxY = 0;
+
+            for (GridPoint point : points) {
+
+                minX =
+                        Math.min(
+                                minX,
+                                point.x
+                        );
+
+                maxX =
+                        Math.max(
+                                maxX,
+                                point.x
+                        );
+
+                minY =
+                        Math.min(
+                                minY,
+                                point.y
+                        );
+
+                maxY =
+                        Math.max(
+                                maxY,
+                                point.y
+                        );
+            }
+
+            minX =
+                    Math.max(
+                            0,
+                            minX
+                    );
+
+            minY =
+                    Math.max(
+                            0,
+                            minY
+                    );
+
+            maxX =
+                    Math.min(
+                            gridMax - 1,
+                            maxX
+                    );
+
+            maxY =
+                    Math.min(
+                            gridMax - 1,
+                            maxY
+                    );
+
+            for (int x = minX; x <= maxX; x++) {
+                for (int y = minY; y <= maxY; y++) {
+
+                    if (
+                            pointInPolygon(
+                                    x + 0.5,
+                                    y + 0.5,
+                                    points
+                            )
+                    ) {
+
+                        cells.add(
+                                x + "," + y
+                        );
+                    }
+                }
+            }
+        }
+
+        return cells;
+    }
+
+    private static boolean pointInPolygon(
+            double x,
+            double y,
+            List<GridPoint> polygon
+    ) {
+
+        boolean inside = false;
+
+        for (
+                int i = 0,
+                j = polygon.size() - 1;
+                i < polygon.size();
+                j = i++
+        ) {
+
+            double xi = polygon.get(i).x;
+            double yi = polygon.get(i).y;
+
+            double xj = polygon.get(j).x;
+            double yj = polygon.get(j).y;
+
+            boolean intersect =
+                    ((yi > y) != (yj > y))
+                            &&
+                    (x <
+                            (xj - xi)
+                                    *
+                            (y - yi)
+                                    /
+                            ((yj - yi) == 0.0
+                                    ? 1e-12
+                                    : (yj - yi))
+                                    + xi);
+
+            if (intersect) {
+                inside = !inside;
+            }
+        }
+
+        return inside;
+    }
+
+    private static int countCellHits(
+            List<TimedPoint> path,
+            Set<String> cells
+    ) {
+
+        int hits = 0;
+
+        for (TimedPoint point : path) {
+
+            if (
+                    cells.contains(
+                            point.x + "," + point.y
+                    )
+            ) {
+                hits++;
+            }
+        }
+
+        return hits;
+    }
+
+    private static int countRiskPoints(
+            List<TimedPoint> path,
+            Map<String, Double> riskCosts
+    ) {
+
+        int count = 0;
+
+        for (TimedPoint point : path) {
+
+            if (
+                    riskCosts.containsKey(
+                            point.x + "," + point.y
+                    )
+            ) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static double calculateRiskCost(
+            List<TimedPoint> path,
+            Map<String, Double> riskCosts
+    ) {
+
+        double cost = 0.0;
+
+        for (TimedPoint point : path) {
+
+            cost +=
+                    riskCosts.getOrDefault(
+                            point.x + "," + point.y,
+                            0.0
+                    );
+        }
+
+        return cost;
     }
 
     // =============================================================
@@ -1193,6 +1903,81 @@ public class DispatchApiServer {
             }
         }
 
+        JsonNode zones =
+                root.get("constraintZones");
+
+        if (
+                zones != null
+                        &&
+                zones.isArray()
+        ) {
+
+            for (JsonNode zone : zones) {
+
+                max =
+                        Math.max(
+                                max,
+                                Math.max(
+                                        zone.path("xMin").asInt(0),
+                                        zone.path("xMax").asInt(0)
+                                )
+                        );
+
+                max =
+                        Math.max(
+                                max,
+                                Math.max(
+                                        zone.path("yMin").asInt(0),
+                                        zone.path("yMax").asInt(0)
+                                )
+                        );
+
+                JsonNode cells =
+                        zone.get("cells");
+
+                if (
+                        cells != null
+                                &&
+                        cells.isArray()
+                ) {
+
+                    for (JsonNode cell : cells) {
+
+                        max =
+                                Math.max(
+                                        max,
+                                        Math.max(
+                                                cell.path("x").asInt(0),
+                                                cell.path("y").asInt(0)
+                                        )
+                                );
+                    }
+                }
+
+                JsonNode polygon =
+                        zone.get("polygon");
+
+                if (
+                        polygon != null
+                                &&
+                        polygon.isArray()
+                ) {
+
+                    for (JsonNode point : polygon) {
+
+                        max =
+                                Math.max(
+                                        max,
+                                        Math.max(
+                                                point.path("x").asInt(0),
+                                                point.path("y").asInt(0)
+                                        )
+                                );
+                    }
+                }
+            }
+        }
+
         return Math.max(
                 100,
                 max + 10
@@ -1370,12 +2155,22 @@ public class DispatchApiServer {
         final Map<String, List<TimeWindow>>
                 occupiedCells;
 
+        final Set<String>
+                hardBlockedCells;
+
+        final Map<String, Double>
+                crowdRiskCosts;
+
         SpaceTimeAStar(
                 int gridMax,
                 long stepMs,
                 long conflictMarginMs,
                 Map<String, List<TimeWindow>>
-                        occupiedCells
+                        occupiedCells,
+                Set<String>
+                        hardBlockedCells,
+                Map<String, Double>
+                        crowdRiskCosts
         ) {
 
             this.gridMax =
@@ -1389,6 +2184,12 @@ public class DispatchApiServer {
 
             this.occupiedCells =
                     occupiedCells;
+
+            this.hardBlockedCells =
+                    hardBlockedCells;
+
+            this.crowdRiskCosts =
+                    crowdRiskCosts;
         }
 
         SegmentResult plan(
@@ -1409,6 +2210,13 @@ public class DispatchApiServer {
             Map<String, Long>
                     bestArrival =
                     new HashMap<>();
+
+            Map<String, Double>
+                    bestCost =
+                    new HashMap<>();
+
+            boolean riskAwareSearch =
+                    !crowdRiskCosts.isEmpty();
 
             NodeTime startNode =
                     new NodeTime(
@@ -1434,6 +2242,11 @@ public class DispatchApiServer {
             bestArrival.put(
                     start.key(),
                     startTimeMs
+            );
+
+            bestCost.put(
+                    start.key(),
+                    0.0
             );
 
             int[][] dirs = {
@@ -1495,6 +2308,17 @@ public class DispatchApiServer {
                         continue;
                     }
 
+                    String key =
+                            nx + "," + ny;
+
+                    if (
+                            hardBlockedCells.contains(
+                                    key
+                            )
+                    ) {
+                        continue;
+                    }
+
                     long normalArrive =
                             curr.arrivalTime
                                     + stepMs;
@@ -1505,24 +2329,6 @@ public class DispatchApiServer {
                                     ny,
                                     normalArrive
                             );
-
-                    String key =
-                            nx + "," + ny;
-
-                    Long known =
-                            bestArrival.get(
-                                    key
-                            );
-
-                    if (
-                            known != null
-                                    &&
-                            known
-                                    <= safe.time
-                    ) {
-
-                        continue;
-                    }
 
                     long addedDelay =
                             Math.max(
@@ -1536,10 +2342,49 @@ public class DispatchApiServer {
                                     /
                             (double) stepMs;
 
+                    double riskPenalty =
+                            crowdRiskCosts
+                                    .getOrDefault(
+                                            key,
+                                            0.0
+                                    );
+
                     double g =
                             curr.g
                                     + 1.0
-                                    + waitPenalty;
+                                    + waitPenalty
+                                    + riskPenalty;
+
+                    if (riskAwareSearch) {
+
+                        Double knownCost =
+                                bestCost.get(
+                                        key
+                                );
+
+                        if (
+                                knownCost != null
+                                        &&
+                                knownCost <= g
+                        ) {
+                            continue;
+                        }
+
+                    } else {
+
+                        Long known =
+                                bestArrival.get(
+                                        key
+                                );
+
+                        if (
+                                known != null
+                                        &&
+                                known <= safe.time
+                        ) {
+                            continue;
+                        }
+                    }
 
                     double f =
                             g
@@ -1568,6 +2413,11 @@ public class DispatchApiServer {
                     bestArrival.put(
                             key,
                             safe.time
+                    );
+
+                    bestCost.put(
+                            key,
+                            g
                     );
 
                     open.add(
@@ -1684,6 +2534,60 @@ public class DispatchApiServer {
                     node.adjustmentCount,
                     node.delayMs
             );
+        }
+    }
+
+    static class ConstraintData {
+
+        final Set<String> noFlyCells;
+        final Set<String> obstacleCells;
+        final Set<String> hardBlockedCells;
+        final Map<String, Double> crowdRiskCosts;
+
+        final int enabledZoneCount;
+        final int noFlyZoneCount;
+        final int obstacleZoneCount;
+        final int crowdRiskZoneCount;
+
+        ConstraintData(
+                Set<String> noFlyCells,
+                Set<String> obstacleCells,
+                Map<String, Double> crowdRiskCosts,
+                int enabledZoneCount,
+                int noFlyZoneCount,
+                int obstacleZoneCount,
+                int crowdRiskZoneCount
+        ) {
+
+            this.noFlyCells =
+                    noFlyCells;
+
+            this.obstacleCells =
+                    obstacleCells;
+
+            this.hardBlockedCells =
+                    new HashSet<>();
+
+            this.hardBlockedCells
+                    .addAll(noFlyCells);
+
+            this.hardBlockedCells
+                    .addAll(obstacleCells);
+
+            this.crowdRiskCosts =
+                    crowdRiskCosts;
+
+            this.enabledZoneCount =
+                    enabledZoneCount;
+
+            this.noFlyZoneCount =
+                    noFlyZoneCount;
+
+            this.obstacleZoneCount =
+                    obstacleZoneCount;
+
+            this.crowdRiskZoneCount =
+                    crowdRiskZoneCount;
         }
     }
 
