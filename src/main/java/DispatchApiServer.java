@@ -47,9 +47,9 @@ public class DispatchApiServer {
 
         System.out.println("========================================");
         System.out.println("Low Altitude Dispatch API started");
-        System.out.println("Version: 3.1");
+        System.out.println("Version: 3.2");
         System.out.println("Algorithm: Space-Time A*");
-        System.out.println("Time mode: absolute internal / relative output");
+        System.out.println("Time mode: status-aware absolute internal / relative output");
         System.out.println("Port: " + port);
         System.out.println("========================================");
     }
@@ -80,7 +80,7 @@ public class DispatchApiServer {
                 "Low Altitude Dispatch API"
         );
         result.put("status", "running");
-        result.put("version", "3.1");
+        result.put("version", "3.2");
         result.put(
                 "algorithmConnected",
                 true
@@ -91,7 +91,7 @@ public class DispatchApiServer {
         );
         result.put(
                 "timeMode",
-                "absolute-internal-relative-output"
+                "status-aware-absolute-internal-relative-output"
         );
 
         send(
@@ -893,13 +893,45 @@ public class DispatchApiServer {
                 continue;
             }
 
-            // 判断该计划是否已经完全过期
+            // =====================================================
+            // V3.2 时间语义
+            //
+            // 已分配：
+            //   尚未真正开始执行，因此不能继续使用“确认执行”时写入的绝对时间。
+            //   每次有新任务进行规划时，将该计划的第一个路径点重新锚定到
+            //   planningStartTimeMs，并保留原路径点之间的相对时间差。
+            //
+            // 执行中：
+            //   认为 start_time_ms / path.tMs 已经代表真实仿真执行时间，
+            //   因此继续按数据库中的绝对时间使用。
+            // =====================================================
+
+            boolean assignedPlan =
+                    "已分配".equals(status);
+
+            long assignedFirstRawTime = 0;
+
+            if (assignedPlan) {
+
+                assignedFirstRawTime =
+                        resolveExistingPointTime(
+                                path.get(0),
+                                rawStartTimeMs,
+                                0,
+                                stepMs,
+                                planningStartTimeMs
+                        );
+            }
+
+            // 判断该计划是否已经完全过期。
+            // 已分配计划永远按“当前规划时刻”重新锚定，因此不会因为
+            // 用户确认后等待了一段时间而被误判为过期。
             JsonNode lastPoint =
                     path.get(
                             path.size() - 1
                     );
 
-            long lastTime =
+            long lastRawTime =
                     resolveExistingPointTime(
                             lastPoint,
                             rawStartTimeMs,
@@ -907,6 +939,27 @@ public class DispatchApiServer {
                             stepMs,
                             planningStartTimeMs
                     );
+
+            long lastTime;
+
+            if (assignedPlan) {
+
+                long relativeOffset =
+                        Math.max(
+                                0,
+                                lastRawTime
+                                        - assignedFirstRawTime
+                        );
+
+                lastTime =
+                        planningStartTimeMs
+                                + relativeOffset;
+
+            } else {
+
+                lastTime =
+                        lastRawTime;
+            }
 
             if (
                     lastTime
@@ -936,7 +989,7 @@ public class DispatchApiServer {
                         point.path("y")
                                 .asInt();
 
-                long t =
+                long rawPointTime =
                         resolveExistingPointTime(
                                 point,
                                 rawStartTimeMs,
@@ -944,6 +997,27 @@ public class DispatchApiServer {
                                 stepMs,
                                 planningStartTimeMs
                         );
+
+                long t;
+
+                if (assignedPlan) {
+
+                    long relativeOffset =
+                            Math.max(
+                                    0,
+                                    rawPointTime
+                                            - assignedFirstRawTime
+                            );
+
+                    t =
+                            planningStartTimeMs
+                                    + relativeOffset;
+
+                } else {
+
+                    t =
+                            rawPointTime;
+                }
 
                 String key =
                         x + "," + y;
