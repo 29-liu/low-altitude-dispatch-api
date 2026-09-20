@@ -21,6 +21,14 @@ public class DispatchApiServer {
     // 用于判断一个时间是不是13位绝对时间戳
     private static final long ABSOLUTE_TIME_THRESHOLD = 1_000_000_000_000L;
 
+    // =============================================================
+    // V3.4 三维态势前端桥接
+    // 保存最近一次调度快照，供 Cesium 前端只读获取。
+    // Render 免费实例重启后内存快照会清空；后续可由女娲同步接口重新写入。
+    // =============================================================
+    private static final Object DASHBOARD_LOCK = new Object();
+    private static ObjectNode latestDashboardState = null;
+
     public static void main(String[] args) throws Exception {
 
         int port = Integer.parseInt(
@@ -42,12 +50,22 @@ public class DispatchApiServer {
                 DispatchApiServer::dispatchPlan
         );
 
+        server.createContext(
+                "/api/dashboard/state",
+                DispatchApiServer::dashboardState
+        );
+
+        server.createContext(
+                "/api/dashboard/sync",
+                DispatchApiServer::dashboardSync
+        );
+
         server.setExecutor(null);
         server.start();
 
         System.out.println("========================================");
         System.out.println("Low Altitude Dispatch API started");
-        System.out.println("Version: 3.3");
+        System.out.println("Version: 3.4");
         System.out.println("Algorithm: Multi-Constraint Space-Time A*");
         System.out.println("Time mode: status-aware absolute internal / relative output");
         System.out.println("Port: " + port);
@@ -80,7 +98,7 @@ public class DispatchApiServer {
                 "Low Altitude Dispatch API"
         );
         result.put("status", "running");
-        result.put("version", "3.3");
+        result.put("version", "3.4");
         result.put(
                 "algorithmConnected",
                 true
@@ -100,6 +118,14 @@ public class DispatchApiServer {
         result.put(
                 "staticConstraintInput",
                 "constraintZones"
+        );
+        result.put(
+                "dashboardStateEndpoint",
+                "/api/dashboard/state"
+        );
+        result.put(
+                "dashboardSyncEndpoint",
+                "/api/dashboard/sync"
         );
 
         send(
@@ -990,6 +1016,13 @@ public class DispatchApiServer {
                     pathArray
             );
 
+            // V3.4：保存本次成功规划的只读态势快照，
+            // Cesium 前端可通过 /api/dashboard/state 获取。
+            updateDashboardFromDispatch(
+                    root,
+                    result
+            );
+
             send(
                     exchange,
                     200,
@@ -1029,6 +1062,282 @@ public class DispatchApiServer {
                     )
             );
         }
+    }
+
+    // =============================================================
+    // V3.4 三维态势前端：读取最近一次快照
+    // =============================================================
+
+    private static void dashboardState(
+            HttpExchange exchange
+    ) throws IOException {
+
+        if ("OPTIONS".equalsIgnoreCase(
+                exchange.getRequestMethod()
+        )) {
+            sendOptions(exchange);
+            return;
+        }
+
+        if (!"GET".equalsIgnoreCase(
+                exchange.getRequestMethod()
+        )) {
+            send(
+                    exchange,
+                    405,
+                    "{\"success\":false,\"message\":\"GET required\"}"
+            );
+            return;
+        }
+
+        ObjectNode out =
+                MAPPER.createObjectNode();
+
+        out.put("success", true);
+        out.put("version", "3.4");
+
+        synchronized (DASHBOARD_LOCK) {
+
+            if (latestDashboardState == null) {
+                out.put("hasData", false);
+                out.put(
+                        "message",
+                        "暂无态势快照，请先完成一次女娲调度任务或调用dashboard同步接口"
+                );
+            } else {
+                out.put("hasData", true);
+                out.set(
+                        "data",
+                        latestDashboardState.deepCopy()
+                );
+            }
+        }
+
+        send(
+                exchange,
+                200,
+                MAPPER.writeValueAsString(out)
+        );
+    }
+
+    // =============================================================
+    // V3.4 三维态势前端：女娲主动同步当前表状态
+    //
+    // 可传入：
+    // drones / flightPlans / constraintZones / tasks / locations
+    // 该接口不参与路径规划，仅用于刷新前端展示状态。
+    // =============================================================
+
+    private static void dashboardSync(
+            HttpExchange exchange
+    ) throws IOException {
+
+        if ("OPTIONS".equalsIgnoreCase(
+                exchange.getRequestMethod()
+        )) {
+            sendOptions(exchange);
+            return;
+        }
+
+        if (!"POST".equalsIgnoreCase(
+                exchange.getRequestMethod()
+        )) {
+            send(
+                    exchange,
+                    405,
+                    "{\"success\":false,\"message\":\"POST required\"}"
+            );
+            return;
+        }
+
+        try {
+            String body =
+                    new String(
+                            exchange.getRequestBody().readAllBytes(),
+                            StandardCharsets.UTF_8
+                    );
+
+            JsonNode incoming =
+                    MAPPER.readTree(body);
+
+            if (
+                    incoming.has("request_json")
+                            && incoming.get("request_json").isTextual()
+                            && !incoming.get("request_json").asText().isBlank()
+            ) {
+                incoming =
+                        MAPPER.readTree(
+                                incoming.get("request_json").asText()
+                        );
+            }
+
+            long now =
+                    System.currentTimeMillis();
+
+            synchronized (DASHBOARD_LOCK) {
+
+                if (latestDashboardState == null) {
+                    latestDashboardState =
+                            MAPPER.createObjectNode();
+                    latestDashboardState.put(
+                            "source",
+                            "nvwa-dashboard-sync"
+                    );
+                }
+
+                latestDashboardState.put(
+                        "updatedAtMs",
+                        now
+                );
+
+                latestDashboardState.put(
+                        "lastUpdateType",
+                        "sync"
+                );
+
+                if (incoming != null && incoming.isObject()) {
+                    Iterator<Map.Entry<String, JsonNode>> fields =
+                            incoming.fields();
+
+                    while (fields.hasNext()) {
+                        Map.Entry<String, JsonNode> entry =
+                                fields.next();
+
+                        latestDashboardState.set(
+                                entry.getKey(),
+                                entry.getValue().deepCopy()
+                        );
+                    }
+                }
+            }
+
+            ObjectNode out =
+                    MAPPER.createObjectNode();
+
+            out.put("success", true);
+            out.put("version", "3.4");
+            out.put("updatedAtMs", now);
+            out.put(
+                    "message",
+                    "三维态势状态同步成功"
+            );
+
+            send(
+                    exchange,
+                    200,
+                    MAPPER.writeValueAsString(out)
+            );
+
+        } catch (Exception e) {
+            ObjectNode error =
+                    MAPPER.createObjectNode();
+
+            error.put("success", false);
+            error.put(
+                    "message",
+                    "态势同步失败：" + e.getMessage()
+            );
+
+            send(
+                    exchange,
+                    500,
+                    MAPPER.writeValueAsString(error)
+            );
+        }
+    }
+
+    private static void updateDashboardFromDispatch(
+            JsonNode request,
+            ObjectNode dispatchResult
+    ) {
+        ObjectNode snapshot =
+                MAPPER.createObjectNode();
+
+        snapshot.put(
+                "source",
+                "dispatch-plan"
+        );
+        snapshot.put(
+                "updatedAtMs",
+                System.currentTimeMillis()
+        );
+        snapshot.put(
+                "lastUpdateType",
+                "dispatch"
+        );
+
+        if (request != null && request.isObject()) {
+            if (request.has("pickup")) {
+                snapshot.set(
+                        "pickup",
+                        request.get("pickup").deepCopy()
+                );
+            }
+            if (request.has("delivery")) {
+                snapshot.set(
+                        "delivery",
+                        request.get("delivery").deepCopy()
+                );
+            }
+            if (request.has("cargoWeight")) {
+                snapshot.set(
+                        "cargoWeight",
+                        request.get("cargoWeight").deepCopy()
+                );
+            }
+            if (request.has("deadlineMin")) {
+                snapshot.set(
+                        "deadlineMin",
+                        request.get("deadlineMin").deepCopy()
+                );
+            }
+            if (request.has("drones")) {
+                snapshot.set(
+                        "drones",
+                        request.get("drones").deepCopy()
+                );
+            }
+            if (request.has("flightPlans")) {
+                snapshot.set(
+                        "flightPlans",
+                        request.get("flightPlans").deepCopy()
+                );
+            }
+            if (request.has("constraintZones")) {
+                snapshot.set(
+                        "constraintZones",
+                        request.get("constraintZones").deepCopy()
+                );
+            }
+        }
+
+        snapshot.set(
+                "dispatchResult",
+                dispatchResult.deepCopy()
+        );
+
+        synchronized (DASHBOARD_LOCK) {
+            latestDashboardState = snapshot;
+        }
+    }
+
+    private static void sendOptions(
+            HttpExchange exchange
+    ) throws IOException {
+        exchange.getResponseHeaders().set(
+                "Access-Control-Allow-Origin",
+                "*"
+        );
+        exchange.getResponseHeaders().set(
+                "Access-Control-Allow-Methods",
+                "GET,POST,OPTIONS"
+        );
+        exchange.getResponseHeaders().set(
+                "Access-Control-Allow-Headers",
+                "Content-Type"
+        );
+        exchange.sendResponseHeaders(204, -1);
+        exchange.close();
     }
 
     // =============================================================
@@ -2909,6 +3218,20 @@ public class DispatchApiServer {
                 .set(
                         "Access-Control-Allow-Origin",
                         "*"
+                );
+
+        exchange
+                .getResponseHeaders()
+                .set(
+                        "Access-Control-Allow-Methods",
+                        "GET,POST,OPTIONS"
+                );
+
+        exchange
+                .getResponseHeaders()
+                .set(
+                        "Access-Control-Allow-Headers",
+                        "Content-Type"
                 );
 
         exchange.sendResponseHeaders(
