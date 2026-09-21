@@ -22,7 +22,7 @@ public class DispatchApiServer {
     private static final long ABSOLUTE_TIME_THRESHOLD = 1_000_000_000_000L;
 
     // =============================================================
-    // V3.4 三维态势前端桥接
+    // V3.5 三维态势前端桥接
     // 保存最近一次调度快照，供 Cesium 前端只读获取。
     // Render 免费实例重启后内存快照会清空；后续可由女娲同步接口重新写入。
     // =============================================================
@@ -65,7 +65,7 @@ public class DispatchApiServer {
 
         System.out.println("========================================");
         System.out.println("Low Altitude Dispatch API started");
-        System.out.println("Version: 3.4");
+        System.out.println("Version: 3.5");
         System.out.println("Algorithm: Multi-Constraint Space-Time A*");
         System.out.println("Time mode: status-aware absolute internal / relative output");
         System.out.println("Port: " + port);
@@ -98,7 +98,7 @@ public class DispatchApiServer {
                 "Low Altitude Dispatch API"
         );
         result.put("status", "running");
-        result.put("version", "3.4");
+        result.put("version", "3.5");
         result.put(
                 "algorithmConnected",
                 true
@@ -126,6 +126,10 @@ public class DispatchApiServer {
         result.put(
                 "dashboardSyncEndpoint",
                 "/api/dashboard/sync"
+        );
+        result.put(
+                "requestBodyCompatibility",
+                "json+request_json-wrapper+request_json-form"
         );
 
         send(
@@ -163,28 +167,7 @@ public class DispatchApiServer {
                     );
 
             JsonNode root =
-                    MAPPER.readTree(body);
-
-            // 女娲HTTP节点当前发送的是：
-            // {"request_json":"..."}
-            if (
-                    root.has("request_json")
-                            &&
-                    root.get("request_json")
-                            .isTextual()
-                            &&
-                    !root.get("request_json")
-                            .asText()
-                            .isBlank()
-            ) {
-
-                root =
-                        MAPPER.readTree(
-                                root
-                                        .get("request_json")
-                                        .asText()
-                        );
-            }
+                    parseFlexibleJsonBody(body);
 
             JsonNode pickupNode =
                     root.get("pickup");
@@ -1016,7 +999,7 @@ public class DispatchApiServer {
                     pathArray
             );
 
-            // V3.4：保存本次成功规划的只读态势快照，
+            // V3.5：保存本次成功规划的只读态势快照，
             // Cesium 前端可通过 /api/dashboard/state 获取。
             updateDashboardFromDispatch(
                     root,
@@ -1065,7 +1048,7 @@ public class DispatchApiServer {
     }
 
     // =============================================================
-    // V3.4 三维态势前端：读取最近一次快照
+    // V3.5 三维态势前端：读取最近一次快照
     // =============================================================
 
     private static void dashboardState(
@@ -1094,7 +1077,7 @@ public class DispatchApiServer {
                 MAPPER.createObjectNode();
 
         out.put("success", true);
-        out.put("version", "3.4");
+        out.put("version", "3.5");
 
         synchronized (DASHBOARD_LOCK) {
 
@@ -1121,7 +1104,200 @@ public class DispatchApiServer {
     }
 
     // =============================================================
-    // V3.4 三维态势前端：女娲主动同步当前表状态
+    // V3.5 请求体兼容解析
+    //
+    // 兼容以下输入形式：
+    // 1) 纯 JSON：{"drones":[...],"flightPlans":[...]}
+    // 2) JSON 包装：{"request_json":"{\"drones\":[...]}"}
+    // 3) JSON 包装：{"request_json":{"drones":[...]}}
+    // 4) 女娲参数体：request_json={"drones":[...]}
+    // 5) Form 编码：request_json=%7B%22drones%22%3A...%7D
+    //
+    // V3.4 的问题是先直接 MAPPER.readTree(body)，当请求体以
+    // request_json= 开头时会在进入兼容分支前就抛出 JSON 解析异常。
+    // V3.5 先识别包装/表单格式，再解析真正的 JSON 负载。
+    // =============================================================
+
+    private static JsonNode parseFlexibleJsonBody(
+            String body
+    ) throws IOException {
+
+        String raw =
+                body == null ? "" : body.trim();
+
+        if (raw.isBlank()) {
+            return MAPPER.createObjectNode();
+        }
+
+        // 先尝试标准 JSON。
+        JsonNode direct = tryParseJson(raw);
+        if (direct != null) {
+            return unwrapRequestJson(direct);
+        }
+
+        // 再兼容女娲 HTTP 节点可能发送的：
+        // request_json={...}
+        // request_json=%7B...%7D
+        String payload =
+                extractRequestJsonPayload(raw);
+
+        if (payload != null && !payload.isBlank()) {
+            JsonNode parsed = tryParseJson(payload);
+            if (parsed != null) {
+                return unwrapRequestJson(parsed);
+            }
+        }
+
+        throw new IOException(
+                "无法解析请求体。支持纯JSON、request_json包装JSON或request_json表单参数"
+        );
+    }
+
+    private static JsonNode unwrapRequestJson(
+            JsonNode node
+    ) throws IOException {
+
+        if (node == null || node.isNull()) {
+            return MAPPER.createObjectNode();
+        }
+
+        // 某些客户端可能把整个 JSON 又包成一个 JSON 字符串。
+        if (node.isTextual()) {
+            String text = node.asText().trim();
+            JsonNode nested = tryParseJson(text);
+            if (nested != null) {
+                return unwrapRequestJson(nested);
+            }
+            return node;
+        }
+
+        if (node.isObject() && node.has("request_json")) {
+            JsonNode wrapped = node.get("request_json");
+
+            if (wrapped == null || wrapped.isNull()) {
+                return MAPPER.createObjectNode();
+            }
+
+            if (wrapped.isObject() || wrapped.isArray()) {
+                return wrapped;
+            }
+
+            if (wrapped.isTextual()) {
+                String text = wrapped.asText().trim();
+                JsonNode nested = tryParseJson(text);
+
+                if (nested != null) {
+                    return unwrapRequestJson(nested);
+                }
+
+                String decoded = decodeFormValue(text);
+                nested = tryParseJson(decoded);
+
+                if (nested != null) {
+                    return unwrapRequestJson(nested);
+                }
+
+                throw new IOException(
+                        "request_json存在，但其中不是有效JSON"
+                );
+            }
+        }
+
+        return node;
+    }
+
+    private static JsonNode tryParseJson(
+            String text
+    ) {
+        try {
+            return MAPPER.readTree(text);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String extractRequestJsonPayload(
+            String raw
+    ) {
+
+        String text = raw == null ? "" : raw.trim();
+
+        if (text.startsWith("?")) {
+            text = text.substring(1);
+        }
+
+        // 最常见的女娲参数体：request_json={...}
+        String equalPrefix = "request_json=";
+        if (text.startsWith(equalPrefix)) {
+            return decodeFormValue(
+                    text.substring(equalPrefix.length()).trim()
+            );
+        }
+
+        // 额外兼容 request_json:{...}
+        String colonPrefix = "request_json:";
+        if (text.startsWith(colonPrefix)) {
+            return decodeFormValue(
+                    text.substring(colonPrefix.length()).trim()
+            );
+        }
+
+        // 兼容 application/x-www-form-urlencoded 多参数形式。
+        String[] parts = text.split("&");
+        for (String part : parts) {
+            int index = part.indexOf('=');
+            if (index <= 0) {
+                continue;
+            }
+
+            String key =
+                    decodeFormValue(
+                            part.substring(0, index).trim()
+                    );
+
+            if (!"request_json".equals(key)) {
+                continue;
+            }
+
+            return decodeFormValue(
+                    part.substring(index + 1).trim()
+            );
+        }
+
+        return null;
+    }
+
+    private static String decodeFormValue(
+            String value
+    ) {
+
+        if (value == null) {
+            return "";
+        }
+
+        String text = value.trim();
+
+        // 原始 JSON 直接返回，避免把 JSON 文本中合法的 + 误解为空格。
+        if (
+                text.startsWith("{")
+                        || text.startsWith("[")
+                        || text.startsWith("\"")
+        ) {
+            return text;
+        }
+
+        try {
+            return java.net.URLDecoder.decode(
+                    text,
+                    StandardCharsets.UTF_8
+            );
+        } catch (Exception ignored) {
+            return text;
+        }
+    }
+
+    // =============================================================
+    // V3.5 三维态势前端：女娲主动同步当前表状态
     //
     // 可传入：
     // drones / flightPlans / constraintZones / tasks / locations
@@ -1158,18 +1334,7 @@ public class DispatchApiServer {
                     );
 
             JsonNode incoming =
-                    MAPPER.readTree(body);
-
-            if (
-                    incoming.has("request_json")
-                            && incoming.get("request_json").isTextual()
-                            && !incoming.get("request_json").asText().isBlank()
-            ) {
-                incoming =
-                        MAPPER.readTree(
-                                incoming.get("request_json").asText()
-                        );
-            }
+                    parseFlexibleJsonBody(body);
 
             long now =
                     System.currentTimeMillis();
@@ -1215,7 +1380,7 @@ public class DispatchApiServer {
                     MAPPER.createObjectNode();
 
             out.put("success", true);
-            out.put("version", "3.4");
+            out.put("version", "3.5");
             out.put("updatedAtMs", now);
             out.put(
                     "message",
